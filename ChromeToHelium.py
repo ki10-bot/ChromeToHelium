@@ -23,12 +23,13 @@ Flow (as in the original):
 
 Note on Chrome 127+ (App-Bound Encryption / v20):
   New Chrome cookies have been encrypted with "v20" since Chrome 127.
-  The v20 key is additionally protected with the SYSTEM DPAPI key and
-  cannot be decrypted by a normal user process (SYSTEM access would be
-  required). This tool migrates all v10 cookies completely and reports
-  v20 cookies transparently as skipped (with count in the report).
-  Helium itself uses v10, so Helium cookies are always migratable.
-  Details: README.md, section "Chrome 127+ / v20".
+  The v20 master key is protected by Chrome's SYSTEM-level elevation
+  service. This tool asks that service (via COM, exactly like Chrome
+  itself does) to unwrap the key, so v20 cookies are migrated too.
+  If the service is unavailable or rejects the call (newer Chrome
+  versions validate the caller), v20 cookies are skipped and reported
+  transparently. Helium itself uses v10, so Helium cookies are always
+  migratable. Details: README.md, section "Chrome 127+ / v20".
 
 Usage:
   python engine.py            Run migration
@@ -614,6 +615,217 @@ def chromium_encrypt_v10(plain: bytes, raw_key: bytes, method: str) -> bytes:
     return b"v10" + nonce + ct + tag
 
 
+def chromium_decrypt_v20(blob: bytes, master_key: bytes) -> bytes | None:
+    """v20 cookie value: AES-256-GCM with the app-bound master key.
+
+    Layout is identical to v10: prefix + 12-byte nonce + ct + 16-byte tag.
+    The plaintext carries the same 32-byte domain prefix (schema >= 24).
+    """
+    if not blob or blob[:3] != b"v20" or len(blob) < 3 + 12 + 16:
+        return None
+    if len(master_key) != 32:
+        return None
+    nonce, ct, tag = blob[3:15], blob[15:-16], blob[-16:]
+    return aes_gcm_decrypt(ct, master_key, nonce, tag)
+
+
+# ---------------------------------------------------------------------------
+# Chrome 127+ (App-Bound Encryption / v20) via the elevation service (COM)
+#
+# Chrome protects the v20 master key with a SYSTEM-level service
+# (elevation_service.exe). Chrome itself unwraps the key by calling the
+# IElevator COM interface (DecryptData). We do exactly the same - no
+# injection, no SYSTEM access needed. Newer Chrome versions may validate
+# the caller path and reject the call; then we fall back to skipping v20.
+# ---------------------------------------------------------------------------
+_ELEVATOR_IIDS = (
+    "{463ABECF-410D-407F-8AF5-0DF35A005CC8}",  # IElevatorChrome
+    "{A949CB4E-C4F9-44C4-B213-6BF8AA9AC69C}",  # IElevator
+)
+_ELEVATOR_CLSIDS_KNOWN = (
+    "{708860E0-F641-4611-8895-7D867DD3675B}",  # Chrome stable (approx. 136)
+    "{DD2646BA-3707-4BF8-B9A7-038691A68FC2}",  # Chrome Beta
+)
+
+
+def _guid_bytes(s: str) -> bytes:
+    import uuid
+    return uuid.UUID(s.strip("{}")).bytes_le
+
+
+def _find_elevator_clsids() -> list[str]:
+    """CLSID(s) of Chrome's elevation service, discovered via the registry."""
+    out = list(_ELEVATOR_CLSIDS_KNOWN)
+    if sys.platform == "win32":
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, "CLSID") as root:
+                i = 0
+                while True:
+                    try:
+                        sub = winreg.EnumKey(root, i)
+                    except OSError:
+                        break
+                    i += 1
+                    try:
+                        with winreg.OpenKey(root, sub + "\\LocalServer32") as k:
+                            server, _ = winreg.QueryValueEx(k, None)
+                        server = str(server).strip().strip('"').lower()
+                        if "elevation_service.exe" in server and "chrome" in server:
+                            guid = "{%s}" % sub
+                            if guid not in out:
+                                out.insert(0, guid)
+                    except OSError:
+                        continue
+        except Exception:
+            pass
+    return out
+
+
+def _elevator_decrypt(blob: bytes) -> bytes | None:
+    """Ask Chrome's elevation service to unwrap the app-bound key blob.
+
+    -> decrypted key material (usually the 32-byte master key) or None.
+    Must run non-elevated (the service rejects elevated callers).
+    """
+    if sys.platform != "win32" or flag("SKIP_DPAPI"):
+        return None
+    try:
+        import ctypes
+        ole32 = ctypes.windll.ole32
+        oleaut32 = ctypes.windll.oleaut32
+        shell32 = ctypes.windll.shell32
+        if shell32.IsUserAnAdmin():
+            warn("Running as administrator - the elevation service rejects "
+                 "elevated callers, v20 cookies will be skipped.")
+            return None
+        ole32.CoInitializeEx(None, 0)
+        try:
+            oleaut32.SysAllocStringByteLen.restype = ctypes.c_void_p
+            oleaut32.SysAllocStringByteLen.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+            oleaut32.SysStringByteLen.restype = ctypes.c_uint32
+            oleaut32.SysStringByteLen.argtypes = [ctypes.c_void_p]
+            oleaut32.SysFreeString.argtypes = [ctypes.c_void_p]
+            ole32.CoCreateInstance.restype = ctypes.c_long
+            ole32.CoCreateInstance.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                               ctypes.c_uint32, ctypes.c_void_p,
+                                               ctypes.POINTER(ctypes.c_void_p)]
+            bstr_in = oleaut32.SysAllocStringByteLen(blob, len(blob))
+            if not bstr_in:
+                return None
+            try:
+                for clsid_s in _find_elevator_clsids():
+                    clsid = (ctypes.c_uint8 * 16).from_buffer_copy(
+                        _guid_bytes(clsid_s))
+                    for iid_s in _ELEVATOR_IIDS:
+                        iid = (ctypes.c_uint8 * 16).from_buffer_copy(
+                            _guid_bytes(iid_s))
+                        punk = ctypes.c_void_p()
+                        hr = ole32.CoCreateInstance(
+                            clsid, None, 4, iid, ctypes.byref(punk))  # CLSCTX_LOCAL_SERVER
+                        if hr != 0 or not punk:
+                            continue
+                        try:
+                            # Same proxy blanket Chrome uses (best effort).
+                            try:
+                                ole32.CoSetProxyBlanket(
+                                    punk, 0xFFFFFFFF, 0xFFFFFFFF, None,
+                                    3, 2, None, 0x80)
+                            except Exception:
+                                pass
+                            vtbl = ctypes.cast(
+                                ctypes.cast(punk, ctypes.POINTER(ctypes.c_void_p))[0],
+                                ctypes.POINTER(ctypes.c_void_p))
+                            decrypt_data = ctypes.WINFUNCTYPE(
+                                ctypes.c_long, ctypes.c_void_p, ctypes.c_void_p,
+                                ctypes.POINTER(ctypes.c_void_p),
+                                ctypes.POINTER(ctypes.c_uint32))(vtbl[5])
+                            bstr_out = ctypes.c_void_p()
+                            last_err = ctypes.c_uint32(0)
+                            hr2 = decrypt_data(punk, bstr_in,
+                                               ctypes.byref(bstr_out),
+                                               ctypes.byref(last_err))
+                            if hr2 == 0 and bstr_out:
+                                try:
+                                    n = oleaut32.SysStringByteLen(bstr_out)
+                                    data = ctypes.string_at(bstr_out, n)
+                                finally:
+                                    oleaut32.SysFreeString(bstr_out)
+                                if data:
+                                    return data
+                        finally:
+                            # Release via IUnknown::Release (vtable slot 2)
+                            try:
+                                release = ctypes.WINFUNCTYPE(
+                                    ctypes.c_ulong, ctypes.c_void_p)(vtbl[2])
+                                release(punk)
+                            except Exception:
+                                pass
+                return None
+            finally:
+                oleaut32.SysFreeString(bstr_in)
+        finally:
+            ole32.CoUninitialize()
+    except Exception as e:
+        warn("Elevation service call failed (%s) - v20 cookies will be skipped." % e)
+        return None
+
+
+def load_v20_key(user_data_root: str, sample) -> bytes | None:
+    """Recover the v20 master key via the elevation service.
+
+    sample: (host_key, v20_blob) of a real cookie, used to validate the
+    recovered key (GCM tag check). -> 32-byte key or None.
+    """
+    # Test hook: C2H_V20_KEY_HEX=<hex> (only for the test suite).
+    hook = env("V20_KEY_HEX")
+    if hook:
+        try:
+            key = bytes.fromhex(hook)
+        except ValueError:
+            key = None
+        if key and sample and chromium_decrypt_v20(sample[1], key) is not None:
+            return key
+        return None
+    state = read_local_state(user_data_root)
+    oscrypt = state.get("os_crypt", {}) if isinstance(state, dict) else {}
+    enc_b64 = oscrypt.get("app_bound_encrypted_key", "")
+    if not enc_b64:
+        return None
+    try:
+        blob = base64.b64decode(enc_b64)
+    except Exception:
+        return None
+    if blob[:4] == b"APPB":
+        blob = blob[4:]
+    out = _elevator_decrypt(blob)
+    if not out:
+        return None
+    candidates = []
+    if len(out) == 32:
+        candidates.append(out)
+    if len(out) > 32:
+        candidates.append(out[-32:])
+    for key in candidates:
+        if sample is None or chromium_decrypt_v20(sample[1], key) is not None:
+            return key
+    return None
+
+
+def find_v20_sample(con) -> tuple | None:
+    """One real v20 cookie (host, blob) from a cookies DB, for validation."""
+    try:
+        row = con.execute(
+            "SELECT host_key, encrypted_value FROM cookies "
+            "WHERE substr(encrypted_value, 1, 3) = x'763230' LIMIT 1").fetchone()
+    except sqlite3.Error:
+        return None
+    if not row:
+        return None
+    host, blob = row
+    return (host or "", bytes(blob))
+
+
 def looks_printable(data: bytes) -> bool:
     if not data:
         return True
@@ -730,6 +942,60 @@ def first_existing(roots) -> str | None:
     return None
 
 
+def helium_root_from_process() -> str | None:
+    """--user-data-dir of a running Helium process (most reliable source)."""
+    if sys.platform != "win32":
+        return None
+    ps = run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+              "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | "
+              "Where-Object { $_.ExecutablePath -like '*Helium*' -or "
+              "$_.ExecutablePath -like '*imput*' } | "
+              "Select-Object -ExpandProperty CommandLine"],
+             timeout=20)
+    if ps is None or ps.returncode != 0:
+        return None
+    for line in ps.stdout.splitlines():
+        m = re.search(r"--user-data-dir=(?:\"([^\"]+)\"|(\S+))", line)
+        if m:
+            return os.path.normpath(m.group(1) or m.group(2))
+    return None
+
+
+def pick_helium_root() -> str | None:
+    """Choose the Helium User Data folder Helium actually uses.
+
+    Priority: explicit override > running process > most recently used
+    candidate. (Writing to a stale folder would silently lose the cookies.)
+    """
+    custom = env("HELIUM_ROOT")
+    if custom:
+        return custom
+    proc = helium_root_from_process()
+    if proc and os.path.isdir(proc):
+        return proc
+    existing = [r for r in helium_roots() if os.path.isdir(r)]
+    if not existing:
+        return None
+    if len(existing) == 1:
+        return existing[0]
+
+    def recency(root: str) -> float:
+        best = 0.0
+        for rel in ("Local State",
+                    os.path.join("Default", "Network", "Cookies"),
+                    os.path.join("Default", "Cookies")):
+            try:
+                best = max(best, os.path.getmtime(os.path.join(root, rel)))
+            except OSError:
+                pass
+        return best
+
+    existing.sort(key=recency, reverse=True)
+    log("  Multiple Helium profile folders found - using the most recently used:")
+    log("    " + existing[0])
+    return existing[0]
+
+
 def find_helium_exe() -> str | None:
     for c in helium_exe_candidates():
         if os.path.isfile(c):
@@ -748,7 +1014,9 @@ def helium_pids() -> list[int]:
     ps = run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
               "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | "
               "Where-Object { $_.ExecutablePath -like '*Helium*' -or "
-              "$_.ExecutablePath -like '*imput*' } | "
+              "$_.ExecutablePath -like '*imput*' -or "
+              "$_.CommandLine -like '*\\Helium\\*' -or "
+              "$_.CommandLine -like '*\\imput\\*' } | "
               "Select-Object -ExpandProperty ProcessId"],
              timeout=20)
     pids = []
@@ -781,6 +1049,31 @@ def quit_helium() -> bool:
             break
         time.sleep(0.3)
     return True
+
+
+def assert_db_unlocked(path: str) -> None:
+    """Abort if a target DB is locked by a still-running browser.
+
+    Writing into a live Helium database would be overwritten by Helium
+    on exit - the migrated cookies would silently disappear.
+    """
+    if flag("SKIP_QUIT") or not os.path.isfile(path):
+        return
+    con = None
+    try:
+        con = sqlite3.connect(path, timeout=0, isolation_level=None)
+        con.execute("BEGIN EXCLUSIVE")
+        con.execute("ROLLBACK")
+    except sqlite3.Error as e:
+        raise Fatal("Database is locked by a running browser:\n  %s\n  (%s)\n"
+                    "  Please close Helium completely (including the tray icon)\n"
+                    "  and run the tool again." % (path, e))
+    finally:
+        if con is not None:
+            try:
+                con.close()
+            except sqlite3.Error:
+                pass
 
 
 def relaunch_helium() -> None:
@@ -939,23 +1232,36 @@ def target_paths_for(helium_root: str, profile: str, existing: list) -> list:
 def transform_payload(enc: bytes, plain_value, host_key: str,
                       src_key: bytes, dst_key: bytes,
                       src_method: str, dst_method: str,
-                      src_hash: bool, dst_hash: bool) -> tuple:
+                      src_hash: bool, dst_hash: bool,
+                      v20_key: bytes | None = None) -> tuple:
     """-> (new encrypted_value, value length, error, is_v20)."""
     if enc and len(enc) > 3:
         if enc[:3] == b"v20":
-            return (None, 0, "v20/App-Bound (SYSTEM access required)", True)
-        if enc[:3] != b"v10":
-            return (None, 0, "unknown format", False)
-        plain, _m = chromium_decrypt_v10(enc, src_key)
-        if plain is None:
-            return (None, 0, "decryption failed", False)
-        if src_hash:
+            if v20_key is None:
+                return (None, 0, "v20/App-Bound (elevation service unavailable)", True)
+            plain = chromium_decrypt_v20(enc, v20_key)
+            if plain is None:
+                return (None, 0, "v20 decryption failed", True)
+            # v20 plaintext carries the same 32-byte domain prefix.
             if len(plain) >= 32 and plain[:32] == host_hash(host_key):
                 value_bytes = plain[32:]
+            elif src_hash:
+                return (None, 0, "v20 hash prefix missing (wrong key?)", True)
             else:
-                return (None, 0, "hash prefix missing (wrong key?)", False)
+                value_bytes = plain
+        elif enc[:3] != b"v10":
+            return (None, 0, "unknown format", False)
         else:
-            value_bytes = plain
+            plain, _m = chromium_decrypt_v10(enc, src_key)
+            if plain is None:
+                return (None, 0, "decryption failed", False)
+            if src_hash:
+                if len(plain) >= 32 and plain[:32] == host_hash(host_key):
+                    value_bytes = plain[32:]
+                else:
+                    return (None, 0, "hash prefix missing (wrong key?)", False)
+            else:
+                value_bytes = plain
     else:
         # Older / unencrypted cookies: plaintext from the value column
         if isinstance(plain_value, bytes):
@@ -1029,8 +1335,9 @@ def make_combined_snapshot(dest: str, row_groups: list) -> str:
 def merge_into_target(target_db: str, src_rows: list, src_cols: list,
                       src_key: bytes, dst_key: bytes,
                       src_method: str, dst_method: str,
-                      src_hash: bool) -> dict:
-    stats = {"inserted": 0, "failed": 0, "skipped_v20": 0, "before": 0, "after": 0, "errors": []}
+                      src_hash: bool, v20_key: bytes | None = None) -> dict:
+    stats = {"inserted": 0, "failed": 0, "skipped_v20": 0, "migrated_v20": 0,
+             "before": 0, "after": 0, "errors": []}
     con = sqlite3.connect(target_db, timeout=20, isolation_level=None)
     try:
         try:
@@ -1066,7 +1373,7 @@ def merge_into_target(target_db: str, src_rows: list, src_cols: list,
             enc = bytes(enc) if isinstance(enc, (bytes, bytearray, memoryview)) else b""
             new_enc, _, err, is_v20 = transform_payload(
                 enc, d.get("value", ""), host, src_key, dst_key,
-                src_method, dst_method, src_hash, dst_hash)
+                src_method, dst_method, src_hash, dst_hash, v20_key)
             if err:
                 if is_v20:
                     stats["skipped_v20"] += 1
@@ -1075,6 +1382,8 @@ def merge_into_target(target_db: str, src_rows: list, src_cols: list,
                     if len(stats["errors"]) < 8:
                         stats["errors"].append("%s/%s: %s" % (host, d.get("name", "?"), err))
                 continue
+            if enc[:3] == b"v20":
+                stats["migrated_v20"] += 1
             values = []
             for c in allcols:
                 if c == "encrypted_value":
@@ -1115,8 +1424,10 @@ def merge_into_target(target_db: str, src_rows: list, src_cols: list,
 
 def build_clone(source_db: str, src_key: bytes, dst_key: bytes,
                 src_method: str, dst_method: str,
-                src_hash: bool, dst_hash: bool, dest: str) -> dict:
-    stats = {"inserted": 0, "failed": 0, "skipped_v20": 0, "before": 0, "after": 0, "errors": []}
+                src_hash: bool, dst_hash: bool, dest: str,
+                v20_key: bytes | None = None) -> dict:
+    stats = {"inserted": 0, "failed": 0, "skipped_v20": 0, "migrated_v20": 0,
+             "before": 0, "after": 0, "errors": []}
     shutil.copy2(source_db, dest)
     con = sqlite3.connect(dest, timeout=20, isolation_level=None)
     try:
@@ -1137,7 +1448,7 @@ def build_clone(source_db: str, src_key: bytes, dst_key: bytes,
             enc = bytes(enc) if isinstance(enc, (bytes, bytearray, memoryview)) else b""
             new_enc, _, err, is_v20 = transform_payload(
                 enc, value, host, src_key, dst_key,
-                src_method, dst_method, src_hash, dst_hash)
+                src_method, dst_method, src_hash, dst_hash, v20_key)
             if err:
                 # Remove rows that cannot be transferred (v20 / broken) cleanly,
                 # instead of leaving dead, unreadable rows in the clone.
@@ -1149,6 +1460,8 @@ def build_clone(source_db: str, src_key: bytes, dst_key: bytes,
                     if len(stats["errors"]) < 8:
                         stats["errors"].append("%s: %s" % (host, err))
                 continue
+            if enc[:3] == b"v20":
+                stats["migrated_v20"] += 1
             updates.append((new_enc, 1 if FORCE_PERSISTENT else 0, rowid))
         con.execute("BEGIN")
         con.executemany(
@@ -1186,7 +1499,7 @@ def main() -> int:
     platform_check()
 
     chrome_root = env("CHROME_ROOT") or first_existing(chrome_roots())
-    helium_root = env("HELIUM_ROOT") or first_existing(helium_roots())
+    helium_root = pick_helium_root()
 
     if not chrome_root:
         raise Fatal("Chrome profile folder not found (%s\\Google\\Chrome\\User Data).\n"
@@ -1195,7 +1508,8 @@ def main() -> int:
     if not helium_root:
         helium_root = helium_roots()[0]
         os.makedirs(helium_root, exist_ok=True)
-        ok("Helium profile folder created: " + helium_root)
+        warn("No existing Helium profile folder found - created: " + helium_root)
+        warn("If Helium uses a different folder, start Helium once and run the tool again.")
     log("  Chrome : " + chrome_root)
     log("  Helium : " + helium_root)
     log("  Crypto : %s" % _BACKEND)
@@ -1230,10 +1544,16 @@ def main() -> int:
     log("  Backup: %d file(s) in %s" % (backed_up, backup))
 
     # Helium must be closed, otherwise it overwrites our changes.
-    if quit_helium():
-        ok("Helium was closed.")
-    else:
-        log("  Helium was not running (or quit is skipped).")
+    quit_helium()
+    if not flag("SKIP_QUIT"):
+        still = helium_pids()
+        if still:
+            raise Fatal("Helium is still running (PIDs: %s) and could not be closed.\n"
+                        "  Please close Helium completely (including the tray icon)\n"
+                        "  and run the tool again. Writing into a running Helium\n"
+                        "  would lose the migrated cookies."
+                        % ", ".join(map(str, still[:12])))
+    ok("Helium is closed.")
 
     # --- Keys --------------------------------------------------------------
     cache = cache_load()
@@ -1299,6 +1619,33 @@ def main() -> int:
             "AES-GCM" if src_method == "gcm" else "AES-CBC",
             "SHA-256 domain prefix (schema >= 24)" if src_hash else "legacy format"))
 
+        # v20 (App-Bound) master key via Chrome's elevation service (COM).
+        v20_key = None
+        v20_sample = None
+        for _combined, _rows, _meta in usable.values():
+            try:
+                _con = sqlite3.connect(_combined)
+                v20_sample = find_v20_sample(_con)
+                _con.close()
+            except sqlite3.Error:
+                pass
+            if v20_sample is not None:
+                break
+        if v20_sample is not None:
+            cached_v20 = cache.get("chrome_v20")
+            if (cached_v20 is not None
+                    and chromium_decrypt_v20(v20_sample[1], cached_v20) is not None):
+                v20_key = cached_v20
+                ok("Chrome v20 key from cache.")
+            else:
+                log("  Chrome v20 cookies found - asking the elevation service for the key ...")
+                v20_key = load_v20_key(chrome_root, v20_sample)
+                if v20_key is not None:
+                    ok("Chrome v20 key recovered - v20 cookies will be migrated too.")
+                    cache["chrome_v20"] = v20_key
+                else:
+                    warn("v20 cookies cannot be decrypted (elevation service unavailable) - they will be skipped.")
+
         def find_probe(profiles):
             for paths in profiles.values():
                 for p in paths:
@@ -1329,8 +1676,8 @@ def main() -> int:
         cache_save(cache)
 
         # --- Migration -----------------------------------------------------
-        grand = {"inserted": 0, "failed": 0, "skipped_v20": 0, "before": 0,
-                 "after": 0, "errors": [], "targets": 0}
+        grand = {"inserted": 0, "failed": 0, "skipped_v20": 0, "migrated_v20": 0,
+                 "before": 0, "after": 0, "errors": [], "targets": 0}
         for prof in sorted(usable):
             combined, rows, _meta = usable[prof]
             tgt_prof = prof if (prof in helium_profiles or prof == "Default") else "Default"
@@ -1342,15 +1689,19 @@ def main() -> int:
             for t in targets:
                 os.makedirs(os.path.dirname(t), exist_ok=True)
                 is_new = not os.path.isfile(t)
+                assert_db_unlocked(t)
                 if is_new:
                     st = build_clone(combined, chrome_key, helium_key,
-                                     src_method, dst_method, src_hash, True, t)
+                                     src_method, dst_method, src_hash, True, t,
+                                     v20_key)
                 else:
                     st = merge_into_target(t, rows, CANON_COLS, chrome_key, helium_key,
-                                           src_method, dst_method, src_hash)
+                                           src_method, dst_method, src_hash,
+                                           v20_key)
                 grand["inserted"] += st["inserted"]
                 grand["failed"] += st["failed"]
                 grand["skipped_v20"] += st["skipped_v20"]
+                grand["migrated_v20"] += st["migrated_v20"]
                 grand["before"] += st["before"]
                 grand["after"] += st["after"]
                 grand["targets"] += 1
@@ -1397,6 +1748,7 @@ def main() -> int:
             "Chrome cookies       : %d" % total_chrome,
             "Rows written         : %d" % grand["inserted"],
             "Failed               : %d" % grand["failed"],
+            "v20 migrated         : %d" % grand["migrated_v20"],
             "v20 skipped          : %d" % grand["skipped_v20"],
             "Target databases     : %d" % grand["targets"],
             "Cookies before       : %d" % grand["before"],
@@ -1409,8 +1761,8 @@ def main() -> int:
         if grand["skipped_v20"]:
             report += [
                 "Note: %d cookie(s) are encrypted with Chrome App-Bound (v20)" % grand["skipped_v20"],
-                "and were skipped (SYSTEM access required).",
-                "Details: README.md, Abschnitt 'Chrome 127+ / v20'.",
+                "and were skipped (elevation service unavailable or rejected).",
+                "Details: README.md, section 'Chrome 127+ / v20'.",
                 "",
             ]
         if grand["errors"]:
@@ -1419,8 +1771,8 @@ def main() -> int:
             f.write("\n".join(report))
 
         log("")
-        log("  DONE: %d cookie rows transferred, %d errors, %d v20 skipped."
-            % (grand["inserted"], grand["failed"], grand["skipped_v20"]))
+        log("  DONE: %d cookie rows transferred (%d of them v20), %d errors, %d v20 skipped."
+            % (grand["inserted"], grand["migrated_v20"], grand["failed"], grand["skipped_v20"]))
         log("  Backup + report: " + backup)
         if grand["failed"]:
             for e in grand["errors"][:6]:

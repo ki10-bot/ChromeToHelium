@@ -83,17 +83,24 @@ WAL/SHM handling, so no old state comes back).
 ## Chrome 127+ / v20 (App-Bound Encryption)
 
 Since **Chrome 127**, Chrome encrypts new cookies with **App-Bound
-Encryption** (format prefix `v20`). The v20 key is additionally protected
-with the **SYSTEM DPAPI key** and cannot be decrypted by a normal user
-process — SYSTEM access (e.g. via Chrome's elevation service) would be
-required.
+Encryption** (format prefix `v20`). The v20 master key is protected by
+Chrome's SYSTEM-level elevation service (`elevation_service.exe`).
 
 **What the tool does about it:**
 
 - All **v10 cookies** are migrated completely.
-- **v20 cookies are skipped** and transparently reported with their count
-  (`v20 skipped : N`) — no corrupt or empty cookies are written.
+- For **v20 cookies**, the tool asks Chrome's own elevation service (via
+  COM, exactly like Chrome itself does) to unwrap the master key — no
+  admin rights, no injection, no SYSTEM access needed. v20 cookies are
+  then migrated too (`v20 migrated : N` in the report).
+- If the elevation service is unavailable or rejects the call (newer
+  Chrome versions validate the caller), v20 cookies are **skipped** and
+  transparently reported (`v20 skipped : N`) — no corrupt or empty
+  cookies are written.
 - Helium itself uses v10, so Helium cookies are always migratable.
+
+**Note:** run the tool as a normal user (not as administrator) — the
+elevation service rejects elevated callers.
 
 **Optional — disable v20 for new cookies** (only if you want to; affects
 *new* cookies only, existing v20 cookies stay v20):
@@ -118,6 +125,8 @@ required.
 | “Chrome profile folder not found” | Start Chrome once, then run the tool again. |
 | “No … key found in Local State” | Start Chrome / Helium once and sign in, then try again. |
 | “Only a v20/App-Bound key was found” | Chrome uses v20 exclusively. See “Chrome 127+ / v20”. |
+| Many “v20 skipped” in the report | The elevation service rejected the key request (newer Chrome). See “Chrome 127+ / v20”. |
+| “Helium is still running …” | Close Helium completely (including tray icon), then run the tool again. |
 | Helium does not start automatically | Just open Helium yourself — the cookies are already written. |
 | Cookies missing in Helium | Check the report (`REPORT.txt`): is there a v20 count? Then see the v20 section. |
 
